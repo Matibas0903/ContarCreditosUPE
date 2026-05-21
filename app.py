@@ -20,7 +20,7 @@ senal_listo = threading.Event()
 def iniciar_analisis():
     boton_iniciar.configure(state="disabled")
     boton_listo.configure(state="normal")
-    label_estado.configure(text="Logueate en el navegador, entrá a Plan de Estudios y presioná 'Listo'")
+    label_estado.configure(text="Logueate en el SIU Guaraní y presioná 'Listo'")
     limpiar()
     hilo = threading.Thread(target=ejecutar_scraping, daemon=True)
     hilo.start()
