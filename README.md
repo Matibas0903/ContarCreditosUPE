@@ -88,5 +88,3 @@ Y listo. Así de simple.
 * No cierres la ventana de Chrome durante el análisis.
 * Se recomienda tener Google Chrome actualizado.
 
-```
-```
