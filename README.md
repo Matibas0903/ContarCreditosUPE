@@ -1,4 +1,4 @@
-````md
+
 # SIU Guaraní Credit Counter
 
 Aplicación desarrollada en Python para automatizar el conteo de créditos académicos en SIU Guaraní UPE.
@@ -31,9 +31,8 @@ Los siguientes inicios serán mucho más rápidos.
 
 Abrí la aplicación y presioná el botón:
 
-```text
 Iniciar análisis
-````
+
 
 Esto abrirá automáticamente una ventana de Google Chrome con SIU Guaraní UPE.
 
