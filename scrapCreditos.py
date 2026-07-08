@@ -90,7 +90,7 @@ def obtener_creditos(log=print, esperar_senal=None):
             creditos = columnas[6].text.strip()
 
             # ✅ Créditos libres: sin nota pero con tipo extracurricular/curso
-            if tipo in ("Actividad Extracurricular", "Curso"):
+            if tipo in ("Actividad Extracurricular", "Curso", "Seminario", "Pasantía", "Taller"):
                 try:
                     if nota != "":  # ✅ solo los que tienen nota
                         creditos_libres.append({
