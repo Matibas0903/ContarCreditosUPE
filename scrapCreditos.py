@@ -1,3 +1,4 @@
+import json
 import re
 import time
 import unicodedata
@@ -7,6 +8,7 @@ from typing import Optional
 
 from selenium import webdriver
 from selenium.common.exceptions import (
+    JavascriptException,
     NoSuchElementException,
     StaleElementReferenceException,
     TimeoutException,
@@ -25,6 +27,61 @@ NOTA_MINIMA_APROBACION = 4
 TIPOS_CREDITO_LIBRE = ("Actividad Extracurricular", "Curso", "Seminario", "Pasantía", "Taller")
 COLUMNAS_MINIMAS = 7
 TIEMPO_ESPERA_LISTO = 600  # segundos máximos esperando el botón "Listo"
+TIEMPO_ESPERA_PANELES = 3  # segundos máximos esperando a que se abran todos los paneles
+
+# ----------------------------
+# SCRIPTS JAVASCRIPT (modo rápido)
+# ----------------------------
+# Clickea todos los acordeones colapsados del plan. Los clicks van ESCALONADOS
+# (60ms entre cada uno): el colapso de Bootstrap anima con transiciones y, si
+# todos los toggles se clickean en el mismo tick, los que llegan mientras otra
+# animación corre quedan sin abrir.
+# Devuelve {total, abiertos, pendientes: [ids]}.
+JS_ABRIR_TODO = """
+const paneles = document.querySelectorAll('a.modulos, a.materia_generica');
+let abiertos = 0;
+const pendientes = [];
+let orden = 0;
+paneles.forEach(boton => {
+    const destino = boton.getAttribute('data-target') || boton.getAttribute('href') || '';
+    if (!destino.startsWith('#')) return;
+    const panel = document.getElementById(destino.slice(1));
+    if (!panel) return;
+    const clases = panel.classList;
+    const abierto = clases.contains('in') || clases.contains('collapsing')
+        || (panel.getAttribute('style') || '').includes('auto');
+    if (abierto) return;
+    setTimeout(() => boton.click(), orden * 60);
+    orden++;
+    abiertos++;
+    pendientes.push(panel.id);
+});
+return JSON.stringify({total: paneles.length, abiertos, pendientes});
+"""
+
+# Lee todas las filas del plan en un solo viaje y devuelve un JSON con las filas
+# válidas (>= COLUMNAS_MINIMAS columnas), marcando cuáles viven en el módulo de
+# créditos libres. Se le pasan los ids de ese módulo como argumento.
+JS_LEER_FILAS = """
+const idsLibres = arguments[0];
+const minCols = arguments[1];
+const filas = [];
+document.querySelectorAll('tbody tr').forEach(fila => {
+    const celdas = fila.querySelectorAll('td');
+    if (celdas.length < minCols) return;   // tablas ajenas al plan
+    const texto = i => (celdas[i] ? celdas[i].textContent.trim() : '');
+    if (!texto(0)) return;
+    filas.push({
+        materia: texto(0),
+        tipo: texto(1),
+        nota: texto(4),
+        creditos: texto(6),
+        esLibre: idsLibres.some(id => fila.closest('#' + CSS.escape(id)) !== null),
+    });
+});
+return JSON.stringify(filas);
+"""
+
 
 
 # ----------------------------
@@ -200,10 +257,20 @@ def _ir_a_plan(driver, log):
 # APERTURA DE ACORDEONES
 # ----------------------------
 def _panel_esta_abierto(panel):
+    """True si el panel está abierto o en plena animación de apertura."""
+    return _panel_abierto_definitivo(panel) or _panel_en_animacion(panel)
+
+
+def _panel_abierto_definitivo(panel):
+    """True solo si el panel terminó de abrirse ('in' en clases o 'auto' en style)."""
     clases = (panel.get_attribute("class") or "").split()
     estilo = panel.get_attribute("style") or ""
-    # Abierto si tiene "in" en clases O "auto" en style (Bootstrap)
     return "in" in clases or "auto" in estilo
+
+
+def _panel_en_animacion(panel):
+    """True si el panel se está abriendo/cerrando (Bootstrap pone 'collapsing')."""
+    return "collapsing" in (panel.get_attribute("class") or "").split()
 
 
 def _abrir_boton(boton, driver, log):
@@ -233,12 +300,8 @@ def _abrir_boton(boton, driver, log):
         pass
 
 
-def _abrir_acordeones(driver, log, control):
-    """Abre los módulos del plan y después cada materia genérica.
-
-    Los módulos van primero: si están colapsados, el contenido de adentro no es
-    visible y Selenium leería las filas vacías.
-    """
+def _abrir_acordeones_clasico(driver, log, control):
+    """Camino lento (respaldo): abre los acordeones de a uno, con espera por cada."""
     modulos = driver.find_elements(By.CSS_SELECTOR, "a.modulos")
     botones = driver.find_elements(By.CSS_SELECTOR, "a.materia_generica")
     if not botones:
@@ -263,6 +326,177 @@ def _abrir_acordeones(driver, log, control):
                 log(f"{'Módulo' if etiqueta == 'módulo' else 'Sección'} {i + 1}: no se pudo abrir ({e}).")
 
 
+def _abrir_acordeones(driver, log, control):
+    """Abre los módulos del plan y después cada materia genérica.
+
+    Los módulos van primero: si están colapsados, el contenido de adentro no es
+    visible y Selenium leería las filas vacías.
+
+    Modo rápido: un solo clic en lote desde JS y una única espera colectiva
+    (en vez de una espera de 0.5s por acordeón). Si falla, se usa el camino clásico.
+    """
+    if control.cancelado.is_set():
+        raise RuntimeError("Análisis cancelado por el usuario.")
+
+    try:
+        datos = json.loads(driver.execute_script(JS_ABRIR_TODO))
+    except (JavascriptException, TypeError, ValueError):
+        log("El clic en lote no estuvo disponible; se abren los acordeones de a uno.")
+        _abrir_acordeones_clasico(driver, log, control)
+        return
+
+    if not datos.get("total"):
+        raise RuntimeError("No se encontraron secciones del plan de estudios.")
+
+    pendientes = datos.get("pendientes") or []
+    if pendientes:
+        log(f"Abriendo {len(pendientes)} de {datos['total']} secciones del plan...")
+        _esperar_paneles(driver, pendientes, TIEMPO_ESPERA_PANELES)
+
+        # Reintento en lote con stagger ancho (350ms > duración de la animación):
+        # cada click cae cuando el anterior ya terminó, así no se pisan.
+        sin_abrir = _paneles_cerrados(driver, pendientes)
+        if sin_abrir:
+            log(f"Reintentando {len(sin_abrir)} paneles que no abrieron...")
+            try:
+                json.loads(driver.execute_script(JS_REINTENTAR, sin_abrir))
+                _esperar_paneles(driver, sin_abrir, max(TIEMPO_ESPERA_PANELES, len(sin_abrir) * 0.4))
+            except (JavascriptException, TypeError, ValueError):
+                pass
+
+        # Último recurso: los que sigan cerrados se clickean de a uno.
+        aun_sin_abrir = _paneles_cerrados(driver, pendientes)
+        for pid in aun_sin_abrir:
+            if control.cancelado.is_set():
+                raise RuntimeError("Análisis cancelado por el usuario.")
+            _reintentar_panel(driver, pid, log)
+
+        # Estado final
+        cerrados = _paneles_cerrados(driver, pendientes)
+        if cerrados:
+            log(
+                f"⚠ {len(cerrados)} paneles no abrieron ({', '.join(cerrados[:6])}); "
+                f"los totales pueden estar INCOMPLETOS."
+            )
+    else:
+        log(f"Las {datos['total']} secciones ya estaban abiertas.")
+
+    if control.cancelado.is_set():
+        raise RuntimeError("Análisis cancelado por el usuario.")
+
+
+# Devuelve la lista de ids de paneles que NO terminaron de abrir.
+# Un solo viaje de red en vez de un find_element por panel.
+JS_PANELES_CERRADOS = """
+return JSON.stringify(arguments[0].filter(id => {
+    const p = document.getElementById(id);
+    if (!p) return false;                 // ya no existe: no lo cuenta como cerrado
+    const c = p.classList;
+    const style = p.getAttribute('style') || '';
+    return !(c.contains('in') || style.includes('auto'));
+}));
+"""
+
+
+def _paneles_cerrados(driver, ids):
+    """Ids de paneles que siguen sin haber terminado de abrir (1 solo viaje)."""
+    if not ids:
+        return []
+    try:
+        crudo = driver.execute_script(JS_PANELES_CERRADOS, list(ids))
+        cerrados = json.loads(crudo)
+        return cerrados if isinstance(cerrados, list) else list(ids)
+    except (JavascriptException, TypeError, ValueError):
+        # Sin JS confiable: chequeo uno por uno.
+        return [pid for pid in ids if not _panel_abierto_definitivo_si_existe(driver, pid)]
+
+
+def _esperar_paneles(driver, ids, tiempo_max):
+    """Espera a que los paneles terminen de abrir; sale temprano si deja de haber progreso.
+
+    El chequeo es un solo viaje de red por polling (no un find_element por panel).
+    Si la cantidad abierta no cambia en ~0.8s, se corta y se pasa al reintento.
+    """
+    ultimo_abiertos = -1
+    ultimo_cambio = time.perf_counter()
+    fin = time.perf_counter() + tiempo_max
+    while time.perf_counter() < fin:
+        cerrados = _paneles_cerrados(driver, ids)
+        if not cerrados:
+            return
+        abiertos = len(ids) - len(cerrados)
+        if abiertos != ultimo_abiertos:
+            ultimo_abiertos = abiertos
+            ultimo_cambio = time.perf_counter()
+        elif time.perf_counter() - ultimo_cambio > 0.8:
+            return  # sin progreso: se acelera al reintento
+        time.sleep(0.1)
+
+
+def _reintentar_panel(driver, id_panel, log):
+    """Clickea de a uno el toggle de un panel que no abrió. True si terminó abierto.
+
+    Si el click fue descartado por el plugin (pasa cuando hay otra animación en
+    curso), se reclickea en vez de esperar los 4s completos en vano.
+    """
+    try:
+        toggles = driver.find_elements(
+            By.CSS_SELECTOR, f"[data-target='#{id_panel}'], [href='#{id_panel}']"
+        )
+        if not toggles:
+            return False
+
+        for _ in range(5):  # hasta 5 clicks: el primero suele descartarse
+            driver.execute_script("arguments[0].click();", toggles[0])
+            try:
+                # En ~0.5s el panel debe abrir o al menos empezar a animarse.
+                WebDriverWait(driver, 0.5, poll_frequency=0.05).until(
+                    lambda d: _panel_abierto_definitivo(d.find_element(By.ID, id_panel))
+                    or _panel_en_animacion(d.find_element(By.ID, id_panel))
+                )
+            except TimeoutException:
+                continue  # el click no surtió efecto; se vuelve a intentar
+
+            # Ya arrancó: se espera a que la animación termine.
+            WebDriverWait(driver, 4, poll_frequency=0.1).until(
+                lambda d: _panel_abierto_definitivo(d.find_element(By.ID, id_panel))
+            )
+            return True
+
+        return False
+    except (TimeoutException, NoSuchElementException, StaleElementReferenceException):
+        return False
+    except Exception:
+        return False
+
+
+# Segundo intento para los paneles que el primer lote dejó cerrados: igual que
+# el lote inicial pero con el stagger más ancho que la animación (~350ms), para
+# que cada click caiga cuando el anterior ya terminó de abrirse.
+JS_REINTENTAR = """
+const ids = arguments[0];
+let orden = 0;
+ids.forEach(id => {
+    const destino = '#' + id;
+    const toggle = document.querySelector(
+        `[data-target="${destino}"], [href="${destino}"]`
+    );
+    if (!toggle) return;
+    setTimeout(() => toggle.click(), orden * 350);
+    orden++;
+});
+return JSON.stringify({reintentados: orden});
+"""
+
+
+def _panel_abierto_definitivo_si_existe(driver, id_panel):
+    """Chequeo definitivo tolerante a que el panel haya desaparecido del DOM."""
+    try:
+        return _panel_abierto_definitivo(driver.find_element(By.ID, id_panel))
+    except NoSuchElementException:
+        return False
+
+
 # ----------------------------
 # LECTURA DE LA TABLA
 # ----------------------------
@@ -284,12 +518,44 @@ def _obtener_filas_plan(driver, log):
     return filas
 
 
+def _leer_filas_js(driver, ids_libres):
+    """Modo rápido: lee todas las filas del plan en un solo viaje de red.
+
+    Devuelve una lista de dicts (materia, tipo, nota, creditos, esLibre) o None
+    si el script no funcionó (para que el llamador caiga al camino clásico).
+    """
+    try:
+        crudo = driver.execute_script(JS_LEER_FILAS, sorted(ids_libres), COLUMNAS_MINIMAS)
+        filas = json.loads(crudo)
+    except (JavascriptException, TypeError, ValueError):
+        return None
+    return filas if isinstance(filas, list) else None
+
+
+def _fila_a_dict(fila, ids_libres):
+    """Convierte una fila (elemento Selenium) al mismo formato que devuelve el JS."""
+    columnas = fila.find_elements(By.TAG_NAME, "td")
+    if len(columnas) < COLUMNAS_MINIMAS:
+        return None
+    materia = columnas[0].text.strip()
+    if not materia:
+        return None
+    return {
+        "materia": materia,
+        "tipo": columnas[1].text.strip(),
+        "nota": columnas[4].text.strip(),
+        "creditos": columnas[6].text.strip(),
+        "esLibre": es_creditoLibre(fila, ids_libres),
+    }
+
+
 def _procesar_filas(filas, log, modulos=None, ids_libres=None):
     """Clasifica las filas en materias y créditos libres.
 
-    El criterio principal es el MÓDULO donde vive la fila (no el tipo de la
-    columna): 'Taller' o 'Seminario' pueden ser materias curriculares. Solo se
-    recurre al tipo de columna si la página no tenía módulos identificables.
+    Recibe dicts ya clasificados (camino rápido por JS, o el clásico convertido
+    con _fila_a_dict). El criterio principal es el MÓDULO donde vive la fila (no
+    el tipo de la columna): 'Taller' o 'Seminario' pueden ser materias
+    curriculares. Solo se recurre al tipo de columna si no había módulos.
     """
     modulos = modulos or {}
     ids_libres = ids_libres or set()
@@ -302,22 +568,11 @@ def _procesar_filas(filas, log, modulos=None, ids_libres=None):
     creditos_libres = []
 
     for fila in filas:
-        try:
-            columnas = fila.find_elements(By.TAG_NAME, "td")
-            if len(columnas) < COLUMNAS_MINIMAS:
-                continue
-            es_libre = es_creditoLibre(fila, ids_libres)
-        except StaleElementReferenceException:
-            log("Se perdió una fila durante la lectura (página redibujada); se ignora.")
-            continue
-
-        materia = columnas[0].text.strip()
-        tipo = columnas[1].text.strip()
-        nota = columnas[4].text.strip()
-        creditos = columnas[6].text.strip()
-
-        if not materia:
-            continue
+        materia = fila["materia"]
+        tipo = fila["tipo"]
+        nota = fila["nota"]
+        creditos = fila["creditos"]
+        es_libre = fila["esLibre"]
 
         # Créditos libres: las filas del módulo 'Créditos libres' con nota cargada
         if es_libre or (modo_fallback and tipo in TIPOS_CREDITO_LIBRE):
@@ -398,6 +653,9 @@ def obtener_creditos(log=print, control=None):
         else:
             _esperar_listo(control, log, driver)
 
+        # A partir de acá se cronometra: la espera del usuario no cuenta.
+        inicio = time.perf_counter()
+
         _ir_a_plan(driver, log)
 
         # El módulo define si una fila es materia o crédito libre.
@@ -408,14 +666,31 @@ def obtener_creditos(log=print, control=None):
         for id_panel, nombre in sorted(modulos.items()):
             if id_panel not in ids_libres:
                 log(f"Módulo '{nombre}' → materias curriculares.")
+        t_modulos = time.perf_counter()
 
         _abrir_acordeones(driver, log, control)
-        filas = _obtener_filas_plan(driver, log)
+        t_acordeones = time.perf_counter()
+
+        # Lectura rápida en un solo viaje; si falla, camino clásico paso a paso.
+        filas = _leer_filas_js(driver, ids_libres)
+        if filas is None:
+            log("Lectura rápida no disponible; se lee la tabla de a fila.")
+            filas_crudas = _obtener_filas_plan(driver, log)
+            filas = [d for d in (_fila_a_dict(f, ids_libres) for f in filas_crudas) if d]
+        t_lectura = time.perf_counter()
+
         materias, creditos_libres = _procesar_filas(filas, log, modulos, ids_libres)
         total_materias, total_libres, total, materias_aprobadas = _calcular_totales(
             materias, creditos_libres, log
         )
+        t_total = time.perf_counter()
 
+        log(
+            f"⏱ Módulos: {len(modulos)} ({t_modulos - inicio:.2f}s) · "
+            f"Apertura: {t_acordeones - t_modulos:.2f}s · "
+            f"Lectura: {len(filas)} filas ({t_lectura - t_acordeones:.2f}s) · "
+            f"Total: {t_total - inicio:.2f}s"
+        )
         log("Análisis finalizado.")
         return total_materias, total_libres, total, materias_aprobadas, creditos_libres
     finally:

@@ -95,6 +95,16 @@ Y listo. Así de simple.
 
 ---
 
+# Rendimiento
+
+Para que el análisis sea rápido, el scraping usa un **modo rápido**: los acordeones se abren con un solo clic en lote y la tabla se lee en un único viaje al navegador (JavaScript), en vez de recorrer cada fila y cada sección de a una.
+
+* Al final del análisis, el cuadro **Registro** muestra los tiempos por fase, por ejemplo:
+  `⏱ Módulos: 2 (0.31s) · Apertura: 42 acordeones (1.95s) · Lectura: 120 filas (0.02s) · Total: 2.4s`
+* Si el modo rápido no está disponible (por ejemplo, si Guaraní cambia la página), la aplicación **cae automáticamente al modo clásico**, más lento pero igual de preciso, y lo avisa en el Registro. Los resultados son idénticos en ambos modos.
+
+---
+
 # Tecnologías utilizadas
 
 * Python
